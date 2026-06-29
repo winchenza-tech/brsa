@@ -2,14 +2,25 @@ import os
 import asyncio
 import traceback
 import pytesseract
+import logging
+import sys
 from PIL import Image
 from pyrogram import Client, filters
 from pyrogram.types import Message
 from playwright.async_api import async_playwright
 
+# --- LOGLARI ZORLA ANLIK AKIŞA ALMA (RAILWAY HİLESİ) ---
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[logging.StreamHandler(sys.stdout)]  # Çıktıları asla bekletmeden direkt Railway'e fırlatır
+)
+logger = logging.getLogger("BorsaMatrisi")
+
+# Linux (Railway) üzerinde Tesseract yolu
 pytesseract.pytesseract.tesseract_cmd = r'/usr/bin/tesseract'
 
-# --- 1. AYARLAR ---
+# --- 1. AYARLAR VE ÇEVRE DEĞİŞKENLERİ ---
 API_ID = int(os.environ.get("API_ID", 0))
 API_HASH = os.environ.get("API_HASH", "")
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
@@ -17,11 +28,11 @@ SESSION_STRING = os.environ.get("SESSION_STRING", "")
 
 TARGET_BOT = "ucretsizderinlikbot"
 
-# --- 2. CLIENTLAR ---
+# --- 2. CLIENT KURULUMLARI ---
 user_app = Client("userbot", session_string=SESSION_STRING, api_id=API_ID, api_hash=API_HASH)
 bot_app = Client("mainbot", bot_token=BOT_TOKEN, api_id=API_ID, api_hash=API_HASH)
 
-# --- 3. GÖRSEL ÜRETİCİ ---
+# --- 3. DİNAMİK GÖRSEL OLUŞTURUCU ---
 async def generate_premium_image(hisse_kodu: str, alici_html: str, satici_html: str) -> str:
     html_template = f"""
     <!DOCTYPE html>
@@ -70,7 +81,9 @@ async def generate_premium_image(hisse_kodu: str, alici_html: str, satici_html: 
 def process_ocr(image_path: str):
     img = Image.open(image_path)
     raw_text = pytesseract.image_to_string(img, lang='tur')
-    print("\n[OCR] Okunan Metin:\n", raw_text)
+    
+    logger.info(f"--- OCR OKUNAN HAM METİN ---\n{raw_text}\n----------------------------")
+    
     alici = '<div class="table-row"><div class="col-first text-green">İŞ YATIRIM</div><div class="col text-yellow">%40.0</div><div class="col text-green">1.50M</div><div class="col text-green">85.00</div></div>'
     satici = '<div class="table-row"><div class="col-first text-red">GARANTİ</div><div class="col text-yellow">%45.0</div><div class="col text-red">-1.20M</div><div class="col text-red">85.20</div></div>'
     return alici, satici
@@ -78,8 +91,7 @@ def process_ocr(image_path: str):
 # --- 5. KOMUT YAKALAYICI ---
 @bot_app.on_message(filters.command(["akd", "derinlik"]))
 async def handle_request(client: Client, message: Message):
-    # ADIM 1 DEBUGU
-    print(f"\n[tetiklendi] Ana bota komut geldi! Komut: {message.text} | Gönderen: {message.from_user.id if message.from_user else 'Bilinmeyen'}")
+    logger.info(f"👉 KOMUT TETİKLENDİ: {message.text} | Kullanıcı ID: {message.from_user.id if message.from_user else 'Grup'}")
     
     if len(message.command) < 2:
         await message.reply_text("⚠️ Lütfen hisse kodu girin. Örn: `/akd GESAN`")
@@ -88,41 +100,36 @@ async def handle_request(client: Client, message: Message):
     hisse_kodu = message.command[1].upper()
     komut_turu = message.command[0]
     
-    print(f"[islem] {hisse_kodu} için sorgu süreci başladı...")
+    logger.info(f"⌛ {hisse_kodu} sorgusu işleniyor...")
     wait_msg = await message.reply_text(f"⏳ **{hisse_kodu}** için Borsa Matrisi taranıyor. Lütfen bekleyin...")
 
     try:
-        # ADIM 2 DEBUGU
-        print(f"[userbot] @{TARGET_BOT} botuna '/{komut_turu} {hisse_kodu}' gönderiliyor...")
+        logger.info(f"📡 @{TARGET_BOT} botuna mesaj atılıyor...")
         await user_app.send_message(TARGET_BOT, f"/{komut_turu} {hisse_kodu}")
         
-        print("[bekleme] Hedef botun yanıtı için 5 saniye bekleniyor...")
+        logger.info("💤 Yanıt için 5 saniye bekleniyor...")
         await asyncio.sleep(5.0) 
         
-        # ADIM 3 DEBUGU
-        print("[userbot] Hedef botun sohbet geçmişinden son görsel aranıyor...")
+        logger.info("🔍 Sohbet geçmişinde görsel aranıyor...")
         downloaded_img = None
         async for msg in user_app.get_chat_history(TARGET_BOT, limit=1):
             if msg.photo:
-                print("[userbot] Görsel bulundu! İndirme başlatılıyor...")
+                logger.info("📸 Görsel yakalandı, indiriliyor...")
                 downloaded_img = await user_app.download_media(msg.photo)
-                print(f"[userbot] Görsel başarıyla indirildi: {downloaded_img}")
+                logger.info(f"💾 Görsel indirildi: {downloaded_img}")
                 
         if not downloaded_img:
-            print("[hata] Sohbet geçmişinde son mesajda resim bulunamadı!")
+            logger.warning("❌ Son mesajda resim bulunamadı!")
             await wait_msg.edit_text("❌ Hedef bot görsel üretmedi veya yanıt zaman aşımına uğradı.")
             return
 
-        # ADIM 4 DEBUGU
-        print("[ocr] Görsel OCR işlemine gönderiliyor...")
+        logger.info("⚙️ OCR işlemi başlatılıyor...")
         alici_html, satici_html = await asyncio.to_thread(process_ocr, downloaded_img)
         
-        # ADIM 5 DEBUGU
-        print("[playwright] Premium Borsa Matrisi şablonu çiziliyor...")
+        logger.info("🎨 Premium şablon resme dönüştürülüyor...")
         final_img = await generate_premium_image(hisse_kodu, alici_html, satici_html)
         
-        # ADIM 6 DEBUGU
-        print("[mainbot] Yeni şablon kullanıcıya gönderiliyor...")
+        logger.info("📤 Hazırlanan şablon kullanıcıya gönderiliyor...")
         await message.reply_photo(
             photo=final_img,
             caption=f"⚡️ **{hisse_kodu}** {komut_turu.upper()} Verisi başarıyla çekildi.\n\n💎 @borsamatrisibot"
@@ -131,28 +138,31 @@ async def handle_request(client: Client, message: Message):
         await wait_msg.delete()
         if os.path.exists(final_img): os.remove(final_img)
         if os.path.exists(downloaded_img): os.remove(downloaded_img)
-        print("[basari] İşlem eksiksiz tamamlandı ve temizlik yapıldı.\n")
+        logger.info("✅ Süreç başarıyla tamamlandı temizlik yapıldı.")
 
     except Exception as e:
-        hata_detay = traceback.format_exc()
-        print("\n[KRİTİK HATA LOGU]:\n", hata_detay)
+        logger.error(f"❌ HATA MEYDANA GELDİ: {str(e)}")
+        logger.error(traceback.format_exc())
         await wait_msg.edit_text(f"❌ İşlem sırasında hata oluştu.\n`{str(e)}`")
 
-# --- 6. BAŞLATICI ---
+# --- 6. ASENKRON MOTOR VE DÖNGÜ ---
 async def start_systems():
-    print("🚀 Borsa Matrisi Ana Botu başlatılıyor...")
+    logger.info("🚀 Borsa Matrisi Ana Botu başlatılıyor...")
     await bot_app.start()
-    print("✅ Ana Bot Aktif! (@borsamatrisibot)")
+    logger.info("✅ Ana Bot Aktif! (@borsamatrisibot)")
 
-    print("🚀 Arka plan Userbot köprüsü başlatılıyor...")
+    logger.info("🚀 Arka plan Userbot köprüsü başlatılıyor...")
     await user_app.start()
-    print("✅ Userbot Köprüsü Aktif!")
+    logger.info("✅ Userbot Köprüsü Aktif!")
 
-    print("💎 Borsa Matrisi Sistemi 7/24 dinlemeye hazır...\n")
-    await asyncio.Event().wait()
+    logger.info("💎 Borsa Matrisi Sistemi 7/24 dinlemeye hazır...")
+    
+    # Kilitlenmeyi önleyen ve botu sonsuza kadar ayakta tutan ana döngü
+    while True:
+        await asyncio.sleep(3600)
 
 if __name__ == "__main__":
     try:
         asyncio.run(start_systems())
     except KeyboardInterrupt:
-        print("👋 Sistem kapatıldı.")
+        logger.info("👋 Sistem kapatıldı.")
