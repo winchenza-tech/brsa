@@ -6,7 +6,7 @@ import pytesseract
 import logging
 import sys
 import re
-from PIL import Image
+from PIL import Image, ImageEnhance, ImageFilter, ImageOps
 from pyrogram import Client, filters
 from pyrogram.types import Message
 from playwright.async_api import async_playwright
@@ -43,75 +43,153 @@ bot_app = Client(
     api_hash=API_HASH
 )
 
-# --- 4. OCR PARSE ---
-def parse_ocr_table(text):
+# --- 4. GÖRSEL ÖN İŞLEME ---
+def preprocess_image(img: Image.Image) -> Image.Image:
+    """
+    Koyu arka planlı, renkli yazılı görsel → Tesseract için beyaz zemin siyah yazı.
+    Adımlar: 2x büyüt → griye çevir → kontrast artır → keskinleştir → threshold
+    """
+    w, h = img.size
+    img = img.resize((w * 2, h * 2), Image.LANCZOS)
+    img = img.convert("L")
+    img = ImageEnhance.Contrast(img).enhance(2.5)
+    img = img.filter(ImageFilter.SHARPEN)
+
+    # Koyu arka plan varsa ters çevir (ortalama piksel < 128 → koyu zemin)
+    avg = sum(img.getdata()) / (img.width * img.height)
+    if avg < 128:
+        img = ImageOps.invert(img)
+
+    # Gürültüyü temizle: sert siyah-beyaz
+    img = img.point(lambda p: 255 if p > 140 else 0, "1").convert("L")
+    return img
+
+
+# --- 5. OCR PARSE ---
+def parse_ocr_table(text: str):
     buyers  = []
     sellers = []
+
+    # Başlık satırlarını atla
+    skip_words = {
+        "KURUM", "ORAN", "NET", "LOT", "MALİYET", "MALIYET",
+        "GÜNLÜK", "GUNLUK", "ANLIK", "ANLUK", "VERİ", "VERI",
+        "DAĞILIM", "DAGILIM", "ARACI", "KURUM DAĞILIMI"
+    }
+
     lines = text.strip().split("\n")
     for line in lines:
         line = line.strip()
-        if not line:
+        if len(line) < 5:
             continue
-        match = re.search(
-            r'([A-Za-zÇçĞğİıÖöŞşÜü][A-Za-zÇçĞğİıÖöŞşÜü0-9\.\s\-]+?)\s+'
-            r'%?([\d]+[.,][\d]+)\s+'
-            r'(-?[\d]+[.,][\d]+)\s+'
-            r'([\d]+[.,][\d]+)',
+        if line.upper() in skip_words:
+            continue
+
+        # Satırdaki tüm sayı gruplarını çek
+        nums = re.findall(r'-?[\d]+[.,][\d]+', line)
+        if len(nums) < 3:
+            continue
+
+        # Satır başındaki metin → kurum adı
+        kurum_match = re.match(
+            r'^([A-ZÇĞİÖŞÜa-zçğışöüI][A-ZÇĞİÖŞÜa-zçğışöüI0-9\.\-\s]{0,25}?)\s+[-\d]',
             line
         )
-        if match:
-            kurum   = match.group(1).strip()
-            oran    = match.group(2).replace(",", ".")
-            lot     = match.group(3).replace(",", ".")
-            maliyet = match.group(4).replace(",", ".")
-            row = {"kurum": kurum, "oran": oran, "lot": lot, "maliyet": maliyet}
-            if float(lot) >= 0:
-                buyers.append(row)
-            else:
-                sellers.append(row)
+        if not kurum_match:
+            continue
+
+        kurum = kurum_match.group(1).strip()
+        if not kurum or kurum.upper() in skip_words:
+            continue
+
+        oran    = nums[0].lstrip("%").replace(",", ".")
+        lot_raw = nums[1].replace(",", ".")
+        maliyet = nums[2].replace(",", ".")
+
+        # Binlik nokta ayracını temizle: "176.164" → 176164
+        # Kural: lot değeri genellikle >100, maliyet <1000
+        try:
+            lot_float = float(lot_raw)
+            # Eğer değer çok küçükse binlik ayraçlı olabilir
+            if abs(lot_float) < 10 and "." in lot_raw:
+                parts = lot_raw.split(".")
+                if len(parts[-1]) == 3:  # "176.164" → son 3 hane
+                    lot_float = float(lot_raw.replace(".", ""))
+        except ValueError:
+            continue
+
+        if abs(lot_float) < 0.01:
+            continue
+
+        # Lot görüntü formatı: binlik nokta, ondalık virgül
+        lot_display = f"{lot_float:,.0f}".replace(",", ".")
+
+        row = {
+            "kurum"  : kurum,
+            "oran"   : oran,
+            "lot"    : lot_display,
+            "maliyet": maliyet
+        }
+
+        if lot_float >= 0:
+            buyers.append(row)
+        else:
+            sellers.append(row)
+
     return buyers, sellers
 
 
-def process_ocr(image_path):
+def process_ocr(image_path: str):
     img = Image.open(image_path)
-    text = pytesseract.image_to_string(img, lang="tur+eng")
-    logger.info(f"📄 OCR ham metin:\n{text[:500]}")
+    processed = preprocess_image(img)
+
+    proc_path = f"/tmp/proc_{os.path.basename(image_path)}.png"
+    processed.save(proc_path)
+
+    # PSM 6: tek blok tablo
+    cfg6 = "--psm 6"
+    text = pytesseract.image_to_string(processed, lang="tur+eng", config=cfg6)
+    logger.info(f"📄 OCR psm6:\n{text[:600]}")
     buyers, sellers = parse_ocr_table(text)
 
-    if not buyers and not sellers:
-        logger.warning("⚠️ İlk OCR parse başarısız, görsel büyütülüp tekrar deneniyor...")
-        w, h = img.size
-        img2 = img.resize((w * 2, h * 2), Image.LANCZOS)
-        text2 = pytesseract.image_to_string(img2, lang="tur+eng")
-        logger.info(f"📄 2. OCR ham metin:\n{text2[:500]}")
-        buyers, sellers = parse_ocr_table(text2)
+    # Az satır geldiyse PSM 4 ile tekrar dene
+    if len(buyers) + len(sellers) < 3:
+        logger.warning("⚠️ Az satır, psm4 deneniyor...")
+        cfg4 = "--psm 4"
+        text2 = pytesseract.image_to_string(processed, lang="tur+eng", config=cfg4)
+        logger.info(f"📄 OCR psm4:\n{text2[:600]}")
+        b2, s2 = parse_ocr_table(text2)
+        if len(b2) + len(s2) > len(buyers) + len(sellers):
+            buyers, sellers = b2, s2
+
+    if os.path.exists(proc_path):
+        os.remove(proc_path)
 
     logger.info(f"✅ Parse — Alıcı: {len(buyers)}, Satıcı: {len(sellers)}")
     return buyers, sellers
 
 
-# --- 5. HTML ŞABLON ---
-def build_rows(rows, is_buyer):
+# --- 6. HTML ŞABLON ---
+def build_rows(rows: list, is_buyer: bool) -> str:
     html = ""
     for i, r in enumerate(rows):
         lot_val = r["lot"]
-        if is_buyer:
-            lot_color = "#0077cc"
-        else:
-            lot_color = "#cc0000"
-            if not lot_val.startswith("-"):
-                lot_val = f"-{lot_val}"
-        bg = "#f7fffe" if is_buyer else "#fff7f7"
+        lot_color = "#0077cc" if is_buyer else "#cc0000"
+        if not is_buyer and not lot_val.startswith("-"):
+            lot_val = f"-{lot_val}"
+
+        bg  = "#f7fffe" if is_buyer else "#fff7f7"
         alt = "#edfdf5" if is_buyer else "#fdedef"
         row_bg = bg if i % 2 == 0 else alt
 
-        # DIĞERsatırını soluk yap
-        diger = r["kurum"].upper().strip() == "DIĞER" or r["kurum"].upper().strip() == "DİĞER"
-        style = "opacity:0.55;" if diger else ""
+        kurum_key = r["kurum"].upper().strip()
+        is_diger  = kurum_key in ("DIĞER", "DİĞER", "DIGER", "DiĞER", "DIGER")
+        opacity   = "opacity:0.50;" if is_diger else ""
+        weight    = "400" if is_diger else "600"
 
         html += f"""
-        <tr style="background:{row_bg};{style}">
-            <td style="font-weight:{'600' if not diger else '400'}">{r['kurum']}</td>
+        <tr style="background:{row_bg};{opacity}">
+            <td style="font-weight:{weight};">{r['kurum']}</td>
             <td style="color:#d97b00;font-weight:700;">%{r['oran']}</td>
             <td style="color:{lot_color};font-weight:700;">{lot_val}</td>
             <td style="color:#444;">{r['maliyet']}</td>
@@ -119,10 +197,9 @@ def build_rows(rows, is_buyer):
     return html
 
 
-async def generate_premium_image(hisse_kodu, buyers, sellers):
+async def generate_premium_image(hisse_kodu: str, buyers: list, sellers: list) -> str:
     buyer_rows  = build_rows(buyers,  is_buyer=True)
     seller_rows = build_rows(sellers, is_buyer=False)
-
     no_data = '<tr><td colspan="4" style="text-align:center;color:#bbb;padding:18px;font-size:13px;">Veri bulunamadı</td></tr>'
 
     html = f"""<!DOCTYPE html>
@@ -131,10 +208,10 @@ async def generate_premium_image(hisse_kodu, buyers, sellers):
 <style>
   * {{ margin:0; padding:0; box-sizing:border-box; }}
   body {{
-    background: #f4f6f9;
+    background: #f0f2f5;
     font-family: 'Segoe UI', Arial, sans-serif;
     width: 720px;
-    padding: 24px 24px 18px 24px;
+    padding: 22px 22px 16px 22px;
   }}
 
   /* BAŞLIK */
@@ -142,12 +219,12 @@ async def generate_premium_image(hisse_kodu, buyers, sellers):
     display: flex;
     justify-content: space-between;
     align-items: flex-end;
-    margin-bottom: 18px;
+    margin-bottom: 16px;
     padding-bottom: 14px;
-    border-bottom: 2px solid #e0e0e0;
+    border-bottom: 2px solid #dde1e7;
   }}
   .hisse {{
-    font-size: 42px;
+    font-size: 44px;
     font-weight: 900;
     color: #0a0a0a;
     letter-spacing: 3px;
@@ -157,17 +234,16 @@ async def generate_premium_image(hisse_kodu, buyers, sellers):
     text-align: right;
     font-size: 12px;
     color: #888;
-    line-height: 1.7;
+    line-height: 1.8;
   }}
-  .meta .title {{ font-size: 14px; font-weight: 700; color: #333; letter-spacing:1px; }}
-  .meta .brand {{ font-size: 13px; font-weight: 700; color: #0077cc; }}
+  .meta .title {{ font-size: 13px; font-weight: 700; color: #333; letter-spacing:1px; }}
+  .meta .brand {{ font-size: 14px; font-weight: 800; color: #0077cc; }}
 
   /* KART */
   .card {{
-    border-radius: 14px;
+    border-radius: 12px;
     overflow: hidden;
-    margin-bottom: 18px;
-    box-shadow: 0 3px 16px rgba(0,0,0,0.09);
+    box-shadow: 0 3px 14px rgba(0,0,0,0.10);
   }}
   .card-buyer  {{ border: 2.5px solid #27ae60; }}
   .card-seller {{ border: 2.5px solid #e74c3c; }}
@@ -183,12 +259,12 @@ async def generate_premium_image(hisse_kodu, buyers, sellers):
     align-items: center;
     gap: 8px;
   }}
-  .card-buyer  .card-head {{ background: linear-gradient(90deg, #1e8449, #27ae60, #2ecc71); }}
-  .card-seller .card-head {{ background: linear-gradient(90deg, #a93226, #c0392b, #e74c3c); }}
+  .card-buyer  .card-head {{ background: linear-gradient(90deg,#1e8449,#27ae60,#2ecc71); }}
+  .card-seller .card-head {{ background: linear-gradient(90deg,#a93226,#c0392b,#e74c3c); }}
 
   /* TABLO */
   table {{ width:100%; border-collapse:collapse; }}
-  thead tr {{ background: #ececec; }}
+  thead tr {{ background:#ececec; }}
   thead th {{
     padding: 8px 14px;
     text-align: left;
@@ -204,14 +280,44 @@ async def generate_premium_image(hisse_kodu, buyers, sellers):
     font-size: 14px;
     border-bottom: 1px solid rgba(0,0,0,0.05);
   }}
-  tbody tr:last-child td {{ border-bottom: none; }}
+  tbody tr:last-child td {{ border-bottom:none; }}
+
+  /* REKLAM BANDI — tablolar arasında */
+  .ad-band {{
+    background: linear-gradient(90deg,#0056b3,#0077cc,#00aaff);
+    color: #fff;
+    text-align: center;
+    padding: 11px 18px;
+    font-size: 13px;
+    font-weight: 700;
+    letter-spacing: 0.8px;
+    border-radius: 10px;
+    box-shadow: 0 3px 12px rgba(0,119,204,0.35);
+    margin: 14px 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 12px;
+  }}
+  .ad-band .ad-icon {{ font-size: 20px; }}
+  .ad-band .ad-text {{ flex: 1; text-align: left; }}
+  .ad-band .ad-link {{
+    background: rgba(255,255,255,0.22);
+    border: 1.5px solid rgba(255,255,255,0.50);
+    border-radius: 7px;
+    padding: 3px 12px;
+    font-size: 14px;
+    font-weight: 900;
+    letter-spacing: 1px;
+    white-space: nowrap;
+  }}
 
   /* ALT BİLGİ */
   .footer {{
     text-align: center;
     font-size: 11px;
     color: #bbb;
-    margin-top: 2px;
+    margin-top: 10px;
     letter-spacing: 0.5px;
   }}
 </style>
@@ -227,6 +333,7 @@ async def generate_premium_image(hisse_kodu, buyers, sellers):
     </div>
   </div>
 
+  <!-- ALICI TABLOSU -->
   <div class="card card-buyer">
     <div class="card-head">▲ &nbsp;NET ALICILAR</div>
     <table>
@@ -237,6 +344,14 @@ async def generate_premium_image(hisse_kodu, buyers, sellers):
     </table>
   </div>
 
+  <!-- REKLAM BANDI -->
+  <div class="ad-band">
+    <span class="ad-icon">⚡</span>
+    <span class="ad-text">Borsa Matrisi Premium — Anlık Derinlik &amp; Aracı Kurum Analizi</span>
+    <span class="ad-link">@borsamatrisibot</span>
+  </div>
+
+  <!-- SATICI TABLOSU -->
   <div class="card card-seller">
     <div class="card-head">▼ &nbsp;NET SATICILLAR</div>
     <table>
@@ -247,7 +362,7 @@ async def generate_premium_image(hisse_kodu, buyers, sellers):
     </table>
   </div>
 
-  <div class="footer">t.me/borsamatrisibot &nbsp;·&nbsp; Borsa Matrisi</div>
+  <div class="footer">t.me/borsamatrisibot &nbsp;·&nbsp; Borsa Matrisi &nbsp;·&nbsp; Tüm veriler anlık güncellenir</div>
 
 </body>
 </html>"""
@@ -257,9 +372,10 @@ async def generate_premium_image(hisse_kodu, buyers, sellers):
         browser = await p.chromium.launch(
             executable_path="/usr/bin/chromium",
             headless=True,
-            args=["--no-sandbox","--disable-setuid-sandbox","--disable-dev-shm-usage","--disable-gpu"]
+            args=["--no-sandbox","--disable-setuid-sandbox",
+                  "--disable-dev-shm-usage","--disable-gpu"]
         )
-        page = await browser.new_page(viewport={"width": 768, "height": 1000})
+        page = await browser.new_page(viewport={"width": 764, "height": 1000})
         await page.set_content(html, wait_until="networkidle")
         await page.screenshot(path=out, full_page=True)
         await browser.close()
@@ -268,7 +384,7 @@ async def generate_premium_image(hisse_kodu, buyers, sellers):
     return out
 
 
-# --- 6. HANDLER'LAR ---
+# --- 7. HANDLER'LAR ---
 @bot_app.on_message(filters.command("test"))
 async def test_cmd(client: Client, message: Message):
     logger.info(f"✅ /test — kullanıcı: {message.from_user.id}")
@@ -322,7 +438,7 @@ async def handle_request(client: Client, message: Message):
         await wait_msg.edit("❌ Bir hata oluştu. Loglara bakılıyor...")
 
 
-# --- 7. BAŞLATICI ---
+# --- 8. BAŞLATICI ---
 async def main():
     logger.info("🚀 Başlatılıyor...")
     async with bot_app, user_app:
