@@ -3,3 +3,4 @@ tgcrypto
 playwright
 pytesseract
 Pillow
+numpy
