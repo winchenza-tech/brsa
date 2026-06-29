@@ -17,6 +17,12 @@ logging.basicConfig(
 )
 logger = logging.getLogger("BorsaMatrisi")
 
+# Railway'in logları kuyrukta (buffer) bekletmesini kodun içinden engelliyoruz
+try:
+    sys.stdout.reconfigure(line_buffering=True)
+except Exception:
+    pass
+
 # Linux (Railway) üzerinde Tesseract yolu
 pytesseract.pytesseract.tesseract_cmd = r'/usr/bin/tesseract'
 
@@ -88,14 +94,14 @@ def process_ocr(image_path: str):
     satici = '<div class="table-row"><div class="col-first text-red">GARANTİ</div><div class="col text-yellow">%45.0</div><div class="col text-red">-1.20M</div><div class="col text-red">85.20</div></div>'
     return alici, satici
 
-# --- 5. BAĞLANTI TEST KOMUTU ---
-@bot_app.on_message(filters.command(["kontrol"]))
+# --- 5. BAĞLANTI TEST KOMUTU (Sadece resmi botu dinlemesini netleştiriyoruz) ---
+@bot_app.on_message(filters.command(["kontrol"]) & filters.bot)
 async def kontrol_test(client: Client, message: Message):
     logger.info(f"👉 /kontrol komutu alındı! (Kullanıcı ID: {message.from_user.id if message.from_user else 'Bilinmeyen'})")
     await message.reply_text("👋 Merhaba! Sistem aktif, sunucu bağlantısı sorunsuz çalışıyor.\n\n💎 Borsa Matrisi")
 
 # --- 6. KOMUT YAKALAYICI (/akd ve /derinlik) ---
-@bot_app.on_message(filters.command(["akd", "derinlik"]))
+@bot_app.on_message(filters.command(["akd", "derinlik"]) & filters.bot)
 async def handle_request(client: Client, message: Message):
     logger.info(f"👉 KOMUT TETİKLENDİ: {message.text} | Kullanıcı ID: {message.from_user.id if message.from_user else 'Bilinmeyen'}")
     
@@ -166,7 +172,7 @@ async def start_systems():
     # Python 3.12+ için Pyrogram'ın resmi ve garantili dinleme kodu:
     await idle()
     
-    # Sistem kapatılırsa botları güvenlice durdur:
+    # Sistem kapanırsa botları güvenlice durdur:
     await bot_app.stop()
     await user_app.stop()
 
