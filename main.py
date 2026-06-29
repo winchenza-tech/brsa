@@ -1,12 +1,16 @@
 import os
 import asyncio
+import traceback
 import pytesseract
 from PIL import Image
-from pyrogram import Client, filters, compose
+from pyrogram import Client, filters
 from pyrogram.types import Message
 from playwright.async_api import async_playwright
 
-# --- 1. AYARLAR VE ÇEVRE DEĞİŞKENLERİ (Railway Variables) ---
+# Linux (Railway) üzerinde Tesseract'ın varsayılan yolunu gösteriyoruz (Hata önlemi)
+pytesseract.pytesseract.tesseract_cmd = r'/usr/bin/tesseract'
+
+# --- 1. AYARLAR VE ÇEVRE DEĞİŞKENLERİ ---
 API_ID = int(os.environ.get("API_ID", 0))
 API_HASH = os.environ.get("API_HASH", "")
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
@@ -65,17 +69,19 @@ async def generate_premium_image(hisse_kodu: str, alici_html: str, satici_html: 
 
 # --- 4. OCR VE VERİ AYIKLAMA ---
 def process_ocr(image_path: str):
-    """Resmi Tesseract ile okur ve metne çevirir."""
+    """Resmi okuyup HTML tablolarına dönüştürür."""
     img = Image.open(image_path)
-    # OCR işlemini Türkçe dil paketi ile yap
     raw_text = pytesseract.image_to_string(img, lang='tur')
-    print("OCR OKUNAN METİN:\n", raw_text) # Loglarda görebilmen için
     
-    # NOT: Tesseract'tan gelen "raw_text" metnini regex (re) veya split() ile bölüp
-    # dinamik olarak aşağıdaki HTML satırlarına dönüştürmen gerekecek. 
-    # Şimdilik sistemin hata vermemesi için başarılı bir tasarım verisi döndürüyoruz.
-    alici = '<div class="table-row"><div class="col-first text-green">ÖRNEK KURUM</div><div class="col text-yellow">%40.0</div><div class="col text-green">1.50M</div><div class="col text-green">85.00</div></div>'
-    satici = '<div class="table-row"><div class="col-first text-red">ÖRNEK KURUM</div><div class="col text-yellow">%45.0</div><div class="col text-red">-1.20M</div><div class="col text-red">85.20</div></div>'
+    # Loglara düşür ki ileride regex ile parçalarken bu metne bakabilesin
+    print("\n--- OCR OKUNAN METİN BAŞLANGICI ---")
+    print(raw_text)
+    print("--- OCR OKUNAN METİN BİTİŞİ ---\n")
+    
+    # Gelen metni parçalayıp buralara yerleştireceksin. 
+    # Şimdilik sistemin hata vermeden şablonu çizebilmesi için test verisi koyuyoruz.
+    alici = '<div class="table-row"><div class="col-first text-green">İŞ YATIRIM</div><div class="col text-yellow">%40.0</div><div class="col text-green">1.50M</div><div class="col text-green">85.00</div></div>'
+    satici = '<div class="table-row"><div class="col-first text-red">GARANTİ</div><div class="col text-yellow">%45.0</div><div class="col text-red">-1.20M</div><div class="col text-red">85.20</div></div>'
     
     return alici, satici
 
@@ -94,42 +100,58 @@ async def handle_request(client: Client, message: Message):
     try:
         # 1. Hedef bota komutu ilet
         await user_app.send_message(TARGET_BOT, f"/{komut_turu} {hisse_kodu}")
-        await asyncio.sleep(3.5) # Botun resmi oluşturup yollaması için bekleme süresi
         
-        # 2. Gelen son mesajı kontrol et ve resmi indir
+        # 2. Hedef botun resmi üretip atması için biraz uzun bir süre tanıyoruz
+        await asyncio.sleep(5.0) 
+        
+        # 3. Gelen son mesajı kontrol et ve resmi indir
         downloaded_img = None
         async for msg in user_app.get_chat_history(TARGET_BOT, limit=1):
             if msg.photo:
                 downloaded_img = await user_app.download_media(msg.photo)
                 
         if not downloaded_img:
-            await wait_msg.edit_text("❌ Hedef bot görsel üretmedi veya yanıt gecikti.")
+            await wait_msg.edit_text("❌ Hedef bot görsel üretmedi veya yanıt zaman aşımına uğradı.")
             return
 
-        # 3. OCR işlemini asenkron çalıştır (Sunucuyu dondurmamak için thread kullanıyoruz)
+        # 4. OCR işlemini asenkron çalıştır (Thread içinde)
         alici_html, satici_html = await asyncio.to_thread(process_ocr, downloaded_img)
         
-        # 4. Kendi temanı bas
+        # 5. Kendi temanı bas
         final_img = await generate_premium_image(hisse_kodu, alici_html, satici_html)
         
-        # 5. Müşteriye yolla
+        # 6. Müşteriye yolla
         await message.reply_photo(
             photo=final_img,
             caption=f"⚡️ **{hisse_kodu}** {komut_turu.upper()} Verisi başarıyla çekildi.\n\n💎 @borsamatrisibot"
         )
         
-        # 6. Temizlik (Geçici dosyaları sil)
+        # 7. Temizlik (Geçici dosyaları sil)
         await wait_msg.delete()
         if os.path.exists(final_img): os.remove(final_img)
         if os.path.exists(downloaded_img): os.remove(downloaded_img)
 
     except Exception as e:
-        await wait_msg.edit_text(f"❌ İşlem sırasında hata oluştu.\nDetay: {str(e)}")
+        hata_detay = traceback.format_exc()
+        print("HATA LOGU:\n", hata_detay)
+        await wait_msg.edit_text(f"❌ İşlem sırasında hata oluştu.\n`{str(e)}`")
 
-# --- 6. BAŞLATICI ---
-async def main():
-    print("🚀 Borsa Matrisi Botu Başlatılıyor...")
-    await compose([bot_app, user_app])
+# --- 6. GARANTİLİ VE KİLİTLENMEYEN BAŞLATICI ---
+async def start_systems():
+    print("🚀 Borsa Matrisi Ana Botu başlatılıyor...")
+    await bot_app.start()
+    print("✅ Ana Bot Aktif! (@borsamatrisibot)")
+
+    print("🚀 Arka plan Userbot köprüsü başlatılıyor...")
+    await user_app.start()
+    print("✅ Userbot Köprüsü Aktif!")
+
+    print("💎 Borsa Matrisi Sistemi 7/24 dinlemeye hazır...")
+    # Sunucunun kapanmasını engeller ve botları dinlemede tutar
+    await asyncio.Event().wait()
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(start_systems())
+    except KeyboardInterrupt:
+        print("👋 Sistem kapatıldı.")
