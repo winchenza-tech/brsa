@@ -1,0 +1,9 @@
+[build]
+buildCommand = "playwright install chromium && playwright install-deps chromium"
+
+[deploy]
+startCommand = "python main.py"
+
+[variables]
+RAILPACK_BUILD_APT_PACKAGES = "tesseract-ocr tesseract-ocr-tur"
+RAILPACK_DEPLOY_APT_PACKAGES = "tesseract-ocr tesseract-ocr-tur"
