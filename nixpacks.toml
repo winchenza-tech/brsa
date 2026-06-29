@@ -3,12 +3,6 @@ aptPkgs = ["tesseract-ocr", "tesseract-ocr-tur"]
 
 [phases.build]
 cmds = [
-    "python -m venv /opt/venv",
-    ". /opt/venv/bin/activate",
     "pip install -r requirements.txt",
     "playwright install chromium",
     "playwright install-deps chromium"
-]
-
-[start]
-cmd = "python main.py"
