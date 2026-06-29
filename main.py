@@ -5,7 +5,7 @@ import pytesseract
 import logging
 import sys
 from PIL import Image
-from pyrogram import Client, filters
+from pyrogram import Client, filters, idle
 from pyrogram.types import Message
 from playwright.async_api import async_playwright
 
@@ -13,7 +13,7 @@ from playwright.async_api import async_playwright
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[logging.StreamHandler(sys.stdout)]  # Çıktıları asla bekletmeden direkt Railway'e fırlatır
+    handlers=[logging.StreamHandler(sys.stdout)]
 )
 logger = logging.getLogger("BorsaMatrisi")
 
@@ -88,10 +88,16 @@ def process_ocr(image_path: str):
     satici = '<div class="table-row"><div class="col-first text-red">GARANTİ</div><div class="col text-yellow">%45.0</div><div class="col text-red">-1.20M</div><div class="col text-red">85.20</div></div>'
     return alici, satici
 
-# --- 5. KOMUT YAKALAYICI ---
+# --- 5. BAĞLANTI TEST KOMUTU ---
+@bot_app.on_message(filters.command(["kontrol"]))
+async def kontrol_test(client: Client, message: Message):
+    logger.info(f"👉 /kontrol komutu alındı! (Kullanıcı ID: {message.from_user.id if message.from_user else 'Bilinmeyen'})")
+    await message.reply_text("👋 Merhaba! Sistem aktif, sunucu bağlantısı sorunsuz çalışıyor.\n\n💎 Borsa Matrisi")
+
+# --- 6. KOMUT YAKALAYICI (/akd ve /derinlik) ---
 @bot_app.on_message(filters.command(["akd", "derinlik"]))
 async def handle_request(client: Client, message: Message):
-    logger.info(f"👉 KOMUT TETİKLENDİ: {message.text} | Kullanıcı ID: {message.from_user.id if message.from_user else 'Grup'}")
+    logger.info(f"👉 KOMUT TETİKLENDİ: {message.text} | Kullanıcı ID: {message.from_user.id if message.from_user else 'Bilinmeyen'}")
     
     if len(message.command) < 2:
         await message.reply_text("⚠️ Lütfen hisse kodu girin. Örn: `/akd GESAN`")
@@ -145,11 +151,11 @@ async def handle_request(client: Client, message: Message):
         logger.error(traceback.format_exc())
         await wait_msg.edit_text(f"❌ İşlem sırasında hata oluştu.\n`{str(e)}`")
 
-# --- 6. ASENKRON MOTOR VE DÖNGÜ ---
+# --- 7. ASENKRON MOTOR VE DÖNGÜ ---
 async def start_systems():
     logger.info("🚀 Borsa Matrisi Ana Botu başlatılıyor...")
     await bot_app.start()
-    logger.info("✅ Ana Bot Aktif! (@borsamatrisibot)")
+    logger.info("✅ Ana Bot Aktif!")
 
     logger.info("🚀 Arka plan Userbot köprüsü başlatılıyor...")
     await user_app.start()
@@ -157,9 +163,12 @@ async def start_systems():
 
     logger.info("💎 Borsa Matrisi Sistemi 7/24 dinlemeye hazır...")
     
-    # Kilitlenmeyi önleyen ve botu sonsuza kadar ayakta tutan ana döngü
-    while True:
-        await asyncio.sleep(3600)
+    # Python 3.12+ için Pyrogram'ın resmi ve garantili dinleme kodu:
+    await idle()
+    
+    # Sistem kapatılırsa botları güvenlice durdur:
+    await bot_app.stop()
+    await user_app.stop()
 
 if __name__ == "__main__":
     try:
