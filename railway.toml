@@ -10,3 +10,6 @@ cmds = [
     "playwright install chromium",
     "playwright install-deps chromium"
 ]
+
+[start]
+cmd = "python -u main.py"
